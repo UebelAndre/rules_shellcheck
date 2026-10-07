@@ -4,7 +4,7 @@
 load("@bazel_skylib//rules:common_settings.bzl", "BuildSettingInfo")
 load("@rules_shell//shell:sh_binary_info.bzl", "ShBinaryInfo")
 load("@rules_shell//shell:sh_info.bzl", "ShInfo")
-load(":toolchain.bzl", "TOOLCHAIN_TYPE")
+load(":toolchain.bzl", "TOOLCHAIN_TYPE", "rlocationpath")
 
 _SHELL_CONTENT = """\
 #!/bin/sh
@@ -14,8 +14,54 @@ set -eu
 {shellcheck} {args}
 """
 
-# Batch files must use CRLF line endings.
-_BATCH_CONTENT = "@ECHO OFF\r\n\r\n{shellcheck} {args}\r\n"
+def _batch_content(ctx, toolchain, opts, files, target_srcs, expect_fail):
+    """Render the Windows test script.
+
+    Runfiles are usually only available as a manifest on Windows, so every
+    file is resolved to an absolute path with `runfiles.bat` from `rules_batch`.
+
+    Args:
+        ctx (ctx): The rule's context object.
+        toolchain (ToolchainInfo): The resolved shellcheck toolchain.
+        opts (list[str]): Leading `shellcheck` options.
+        files (list[File]): All files to lint.
+        target_srcs (list[File]): The subset of `files` collected from `targets`.
+        expect_fail (bool): Whether `shellcheck` is expected to fail.
+
+    Returns:
+        str: The script content.
+    """
+    runfiles_bat = rlocationpath(ctx.file._runfiles_bat, ctx.workspace_name)
+    lines = [
+        "@ECHO OFF",
+        # Locate runfiles.bat in the runfiles tree, or in the manifest if there is no tree.
+        'set "RLOCATION=%RUNFILES_DIR%\\{}"'.format(runfiles_bat.replace("/", "\\")),
+        'if not exist "%RLOCATION%" if defined RUNFILES_MANIFEST_FILE for /F "usebackq tokens=1,*" %%i in (`findstr /b /l /c:"{} " "%RUNFILES_MANIFEST_FILE%"`) do set "RLOCATION=%%j"'.format(runfiles_bat),
+        'if not exist "%RLOCATION%" (echo>&2 ERROR: cannot find {} in runfiles & exit /b 1)'.format(runfiles_bat),
+        'set "RLOCATION=%RLOCATION:/=\\%"',
+    ]
+
+    # FILE_0 is shellcheck, FILE_1 the rc file and the rest are `files`.
+    for i, file in enumerate([toolchain.shellcheck, toolchain.shellcheckrc] + files):
+        lines.append('call "%RLOCATION%" "{}" FILE_{} || exit /b 1'.format(rlocationpath(file, ctx.workspace_name), i))
+
+    # Directories are not listed in the manifest, so each `--source-path` is
+    # the directory of one resolved source from it. `%~dp` ends with a
+    # backslash, which would escape the closing quote; append `.` to avoid that.
+    dirs = {}
+    for i, src in enumerate(target_srcs):
+        dirs.setdefault(src.short_path.rpartition("/")[0], len(ctx.files.data) + i + 2)
+    for i, file_index in enumerate(dirs.values()):
+        lines.append('for %%F in ("%FILE_{}%") do set "DIR_{}=%%~dpF."'.format(file_index, i))
+
+    args = opts + ['--rcfile="%FILE_1%"']
+    args.extend(['--source-path="%DIR_{}%"'.format(i) for i in range(len(dirs))])
+    args.extend(['"%FILE_{}%"'.format(i + 2) for i in range(len(files))])
+    lines.append('"%FILE_0%" {}'.format(" ".join(args)))
+    lines.append("if errorlevel 1 exit /b 0\r\nexit /b 1" if expect_fail else "exit /b %ERRORLEVEL%")
+
+    # Batch files must use CRLF line endings.
+    return "\r\n".join(lines) + "\r\n"
 
 def shellcheck_test_impl(ctx, expect_fail = False):
     """The implementation of the `shellcheck_test` rule.
@@ -36,6 +82,7 @@ def shellcheck_test_impl(ctx, expect_fail = False):
         ctx.label.name,
         ".bat" if is_windows else ".sh",
     ))
+    runfiles = [toolchain.shellcheck, toolchain.shellcheckrc]
 
     cmd = []
     if ctx.attr.format:
@@ -56,33 +103,31 @@ def shellcheck_test_impl(ctx, expect_fail = False):
         if src.is_source or check_generated
     ]
     files = ctx.files.data + target_srcs
+    runfiles.extend(files)
 
-    # Linting runs from the runfiles tree, so `--source-path` is derived from
-    # `short_path` rather than the exec root paths in `ShellcheckSrcsInfo`.
-    source_paths = depset([src.short_path.rpartition("/")[0] or "." for src in target_srcs]).to_list()
-
-    shellcheck_path = toolchain.shellcheck.short_path
-    shellcheck_rc = toolchain.shellcheckrc.short_path
-    srcs = [f.short_path for f in files]
     if is_windows:
-        shellcheck_path.replace("/", "\\")
-        shellcheck_rc.replace("/", "\\")
-        srcs = [src.replace("/", "\\") for src in srcs]
-        source_paths = [path.replace("/", "\\") for path in source_paths]
+        content = _batch_content(ctx, toolchain, cmd, files, target_srcs, expect_fail)
+        runfiles.append(ctx.file._runfiles_bat)
+    else:
+        # Linting runs from the runfiles tree, so `--source-path` is derived from
+        # `short_path` rather than the exec root paths in `ShellcheckSrcsInfo`.
+        source_paths = depset([src.short_path.rpartition("/")[0] or "." for src in target_srcs]).to_list()
 
-    cmd.append("--rcfile={}".format(shellcheck_rc))
-    cmd.extend(["--source-path={}".format(path) for path in source_paths])
-    cmd.extend(srcs)
+        cmd.append("--rcfile={}".format(toolchain.shellcheckrc.short_path))
+        cmd.extend(["--source-path={}".format(path) for path in source_paths])
+        cmd.extend([f.short_path for f in files])
 
-    if expect_fail:
-        cmd.append("|| exit 0; exit 1")
+        if expect_fail:
+            cmd.append("|| exit 0; exit 1")
+
+        content = _SHELL_CONTENT.format(
+            shellcheck = toolchain.shellcheck.short_path,
+            args = " ".join(cmd),
+        )
 
     ctx.actions.write(
         output = executable,
-        content = (_BATCH_CONTENT if is_windows else _SHELL_CONTENT).format(
-            shellcheck = shellcheck_path,
-            args = " ".join(cmd),
-        ),
+        content = content,
         is_executable = True,
     )
 
@@ -90,7 +135,7 @@ def shellcheck_test_impl(ctx, expect_fail = False):
         DefaultInfo(
             executable = executable,
             runfiles = ctx.runfiles(
-                files = [toolchain.shellcheck, toolchain.shellcheckrc] + files,
+                files = runfiles,
                 transitive_files = toolchain.all_files,
             ),
         ),
@@ -164,6 +209,10 @@ ATTRS = {
     ),
     "_check_generated": attr.label(
         default = Label("//shellcheck/settings:check_generated"),
+    ),
+    "_runfiles_bat": attr.label(
+        default = Label("@rules_batch//batch/runfiles:runfiles.bat"),
+        allow_single_file = True,
     ),
     "_windows_constraint": attr.label(
         default = Label("@platforms//os:windows"),

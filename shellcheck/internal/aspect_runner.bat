@@ -1,24 +1,18 @@
-@echo off
+@ECHO OFF
 setlocal enabledelayedexpansion
 
-set "output=%~1"
-shift
-
-if not "%~1"=="--" (
-    echo aspect_runner: expected '--' after output path, got: %~1 1>&2
-    exit /b 1
+@REM Usage: aspect_runner.bat <output> -- <shellcheck> [args...]
+@REM
+@REM Arguments are split from %* because cmd.exe also splits %1..%9 on "="
+@REM (as in --rcfile=...). Forward slashes are replaced since cmd.exe cannot
+@REM run a command whose path contains them.
+set "args=%*"
+for /F "usebackq tokens=1,2,3,*" %%A in ('!args!') do (
+    set "output=%%~A"
+    set "shellcheck=%%~C"
+    set "shellcheck_args=%%D"
 )
-shift
 
-break > "%output%"
-
-set "cmd="
-:loop
-if "%~1"=="" goto :run
-set "cmd=!cmd! %1"
-shift
-goto :loop
-
-:run
-%cmd%
-exit /b %errorlevel%
+type nul > "!output:/=\!"
+"!shellcheck:/=\!" !shellcheck_args!
+exit /b !ERRORLEVEL!
